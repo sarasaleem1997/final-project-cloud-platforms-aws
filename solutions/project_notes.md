@@ -752,6 +752,50 @@ Round-trip browser → Fargate → SageMaker → Fargate → browser: ~50–150m
 
 ---
 
+## Task 12: Architecture Diagram + Demo Video
+
+**Deliverables:** `solutions/architecture_diagram.png`, `solutions/demo_video.mp4`
+
+**Git tag:** `task-12`
+
+### Architecture Diagram
+
+Generated with `solutions/generate_diagram.py` (matplotlib). Shows all required components:
+
+| Component | AWS Service | Detail |
+|-----------|-------------|--------|
+| User browser | — | http://3.253.10.36:8501 |
+| App container | ECS / Fargate | vaultech-app-service, 0.5 vCPU, 1 GB RAM |
+| Docker image | Amazon ECR | 999390550986.dkr.ecr.eu-west-1.amazonaws.com/vaultech-app |
+| Prediction API | SageMaker Endpoint | vaultech-bath-predictor, ml.t2.medium, XGBoost 3.0-5 |
+| Model artifact | Amazon S3 | vaultech-models-999390550986/models/.../model.tar.gz |
+| Model versions | Model Registry | vaultech-bath-predictor-group, MAE=0.92s, R²=0.69 |
+| Historical data | Gold Parquet (in image) | data/gold/pieces.parquet, 169k pieces |
+
+**Data flow arrows:** User → ECS → SageMaker → S3 (model load) → prediction back to user. Model Registry ↔ SageMaker. ECR → ECS (image pull).
+
+### Demo Video Outline (5 minutes)
+
+**Part 1 — Architecture (1 min):** Open the diagram, explain each component and how they connect.
+
+**Part 2 — Live App (3 min):**
+- Open http://3.253.10.36:8501 in browser
+- Show filters (die matrix, date range, slow pieces toggle)
+- Select a piece → show detail panel (cumulative times, partial times, bar chart)
+- Point to inference debug panel: CSV payload sent, float response, latency (~40 ms)
+- This proves prediction is coming from SageMaker, not local code
+
+**Part 3 — Data Flow Summary (1 min):** Step-by-step: browser → Fargate (Streamlit) → invoke_endpoint (boto3) → SageMaker XGBoost container → float response → displayed in app.
+
+### Key things to say in the video
+
+- "The model predicts bath time after only the 2nd strike — about 18 seconds into the 58-second journey — early enough to raise a real-time alert while the piece is still on the line"
+- "ECS Fargate is serverless — no EC2 instances to manage, AWS handles the underlying server"
+- "The `SAGEMAKER_ENDPOINT_NAME` environment variable injected by the ECS task definition switches the app from local inference to cloud inference"
+- "The debug panel shows the exact CSV payload sent and the raw float response — proving the round-trip to SageMaker"
+
+---
+
 ## Environment Reference
 
 | Command | What it does |
