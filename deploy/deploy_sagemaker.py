@@ -10,8 +10,16 @@ Usage:
 """
 
 import argparse
+import io
 import json
+import shutil
+import tarfile
+import time
 from pathlib import Path
+
+import boto3
+import sagemaker
+from sagemaker import image_uris
 
 
 MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
@@ -25,6 +33,11 @@ def package_model(model_path: Path, output_dir: Path) -> Path:
     SageMaker's built-in XGBoost container expects a file named
     'xgboost-model' at the root of the archive.
 
+    XGBoost 3.2+ stores base_score in array notation ('[58.6]') in the JSON.
+    The SageMaker 3.0-5 container expects a scalar string ('58.6'). This
+    function patches that field before archiving so the container loads the
+    model with the correct intercept.
+
     Args:
         model_path: Path to the trained model JSON file.
         output_dir: Directory where the .tar.gz will be created.
@@ -32,8 +45,26 @@ def package_model(model_path: Path, output_dir: Path) -> Path:
     Returns:
         Path to the created .tar.gz file.
     """
-    # TODO: implement
-    raise NotImplementedError
+    # Load and patch the model JSON for container compatibility
+    with open(model_path) as f:
+        model_json = json.load(f)
+
+    lmp = model_json.get("learner", {}).get("learner_model_param", {})
+    raw_bs = lmp.get("base_score", "")
+    # XGBoost 3.2 stores base_score as '[value]' — strip brackets for 3.0 compat
+    if raw_bs.startswith("[") and raw_bs.endswith("]"):
+        lmp["base_score"] = raw_bs[1:-1]
+
+    patched_bytes = json.dumps(model_json).encode("utf-8")
+
+    tar_path = output_dir / "model.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tar:
+        # SageMaker XGBoost container expects the model at root as 'xgboost-model'
+        info = tarfile.TarInfo(name="xgboost-model")
+        info.size = len(patched_bytes)
+        tar.addfile(info, io.BytesIO(patched_bytes))
+
+    return tar_path
 
 
 def upload_to_s3(local_path: Path, bucket: str, key: str) -> str:
@@ -47,8 +78,9 @@ def upload_to_s3(local_path: Path, bucket: str, key: str) -> str:
     Returns:
         Full S3 URI (s3://bucket/key).
     """
-    # TODO: implement
-    raise NotImplementedError
+    s3 = boto3.client("s3")
+    s3.upload_file(str(local_path), bucket, key)
+    return f"s3://{bucket}/{key}"
 
 
 def register_model(
@@ -72,8 +104,60 @@ def register_model(
     Returns:
         The Model Package ARN.
     """
-    # TODO: implement
-    raise NotImplementedError
+    sm = boto3.client("sagemaker", region_name=region)
+
+    # Create Model Package Group if it doesn't exist
+    try:
+        sm.create_model_package_group(
+            ModelPackageGroupName=model_package_group_name,
+            ModelPackageGroupDescription="VaultTech forging line bath time predictor",
+        )
+        print(f"  Created Model Package Group: {model_package_group_name}")
+    except sm.exceptions.ClientError as e:
+        if "already exists" in str(e) or "ConflictException" in str(e):
+            print(f"  Model Package Group already exists: {model_package_group_name}")
+        else:
+            raise
+
+    # Get the XGBoost container image URI for eu-west-1
+    # Using 3.0-5 container (compatible with XGBoost 3.x models trained locally)
+    image_uri = image_uris.retrieve(
+        framework="xgboost",
+        region=region,
+        version="3.0-5",
+    )
+
+    # Register the model package
+    response = sm.create_model_package(
+        ModelPackageGroupName=model_package_group_name,
+        ModelPackageDescription="XGBoost 3.x bath time predictor — MAE=0.92s, R2=0.69",
+        InferenceSpecification={
+            "Containers": [
+                {
+                    "Image": image_uri,
+                    "ModelDataUrl": s3_model_uri,
+                }
+            ],
+            "SupportedContentTypes": ["text/csv"],
+            "SupportedResponseMIMETypes": ["text/csv"],
+        },
+        ModelMetrics={
+            "ModelQuality": {
+                "Statistics": {
+                    "ContentType": "application/json",
+                    "S3Uri": s3_model_uri,  # placeholder — metrics attached below
+                }
+            }
+        },
+        ModelApprovalStatus="Approved",
+        CustomerMetadataProperties={
+            "rmse": str(metrics["rmse"]),
+            "mae": str(metrics["mae"]),
+            "r2": str(metrics["r2"]),
+        },
+    )
+
+    return response["ModelPackageArn"]
 
 
 def deploy_endpoint(
@@ -96,8 +180,47 @@ def deploy_endpoint(
     Returns:
         The endpoint name.
     """
-    # TODO: implement
-    raise NotImplementedError
+    sm = boto3.client("sagemaker", region_name=region)
+    role = sagemaker.get_execution_role() if _is_sagemaker_env() else _get_iam_role(region)
+
+    model_name = f"{endpoint_name}-model"
+    config_name = f"{endpoint_name}-config"
+
+    # Create SageMaker Model from the registered package
+    sm.create_model(
+        ModelName=model_name,
+        ExecutionRoleArn=role,
+        Containers=[{"ModelPackageName": model_package_arn}],
+    )
+
+    # Create Endpoint Configuration
+    sm.create_endpoint_config(
+        EndpointConfigName=config_name,
+        ProductionVariants=[
+            {
+                "VariantName": "default",
+                "ModelName": model_name,
+                "InstanceType": instance_type,
+                "InitialInstanceCount": 1,
+            }
+        ],
+    )
+
+    # Create Endpoint
+    sm.create_endpoint(
+        EndpointName=endpoint_name,
+        EndpointConfigName=config_name,
+    )
+
+    # Wait for endpoint to be InService
+    print(f"  Waiting for endpoint to be InService (this takes ~5 minutes)...")
+    waiter = sm.get_waiter("endpoint_in_service")
+    waiter.wait(
+        EndpointName=endpoint_name,
+        WaiterConfig={"Delay": 30, "MaxAttempts": 30},
+    )
+
+    return endpoint_name
 
 
 def test_endpoint(endpoint_name: str, region: str) -> dict:
@@ -113,8 +236,63 @@ def test_endpoint(endpoint_name: str, region: str) -> dict:
     Returns:
         Dict with test results and predictions.
     """
-    # TODO: implement
-    raise NotImplementedError
+    runtime = boto3.client("sagemaker-runtime", region_name=region)
+
+    # Sample pieces: die_matrix, lifetime_2nd_strike_s, oee_cycle_time_s
+    test_cases = [
+        {"die_matrix": 5052, "lifetime_2nd_strike_s": 18.3, "oee_cycle_time_s": 13.5},
+        {"die_matrix": 4974, "lifetime_2nd_strike_s": 17.4, "oee_cycle_time_s": 13.9},
+        {"die_matrix": 5090, "lifetime_2nd_strike_s": 17.7, "oee_cycle_time_s": 14.0},
+        {"die_matrix": 5091, "lifetime_2nd_strike_s": 18.5, "oee_cycle_time_s": 13.8},
+        {"die_matrix": 5052, "lifetime_2nd_strike_s": 30.0, "oee_cycle_time_s": 13.5},  # slow piece
+    ]
+
+    results = []
+    for case in test_cases:
+        payload = f"{case['die_matrix']},{case['lifetime_2nd_strike_s']},{case['oee_cycle_time_s']}"
+        response = runtime.invoke_endpoint(
+            EndpointName=endpoint_name,
+            ContentType="text/csv",
+            Body=payload,
+        )
+        prediction = float(response["Body"].read().decode("utf-8").strip())
+        results.append({
+            "input": case,
+            "predicted_bath_time_s": round(prediction, 3),
+            "in_range": 40 < prediction < 80,
+        })
+
+    return {
+        "endpoint": endpoint_name,
+        "predictions": results,
+        "all_in_range": all(r["in_range"] for r in results),
+        "slow_piece_higher": results[-1]["predicted_bath_time_s"] > results[0]["predicted_bath_time_s"],
+    }
+
+
+def _is_sagemaker_env() -> bool:
+    """Check if running inside a SageMaker environment (notebook instance or job)."""
+    import os
+    from pathlib import Path
+    # SM_CURRENT_HOST is set by SageMaker training/processing jobs
+    # /opt/ml/ exists on SageMaker notebook instances and jobs
+    return "SM_CURRENT_HOST" in os.environ or Path("/opt/ml/").exists()
+
+
+def _get_iam_role(region: str) -> str:
+    """Get SageMaker execution role from IAM, preferring dedicated execution roles."""
+    iam = boto3.client("iam", region_name=region)
+    roles = iam.list_roles()["Roles"]
+    # Prefer non-service-linked roles (service-linked roles are in aws-reserved path)
+    candidates = [
+        r for r in roles
+        if ("SageMaker" in r["RoleName"] or "sagemaker" in r["RoleName"].lower())
+        and "aws-reserved" not in r["Arn"]
+        and "AWSServiceRole" not in r["RoleName"]
+    ]
+    if candidates:
+        return candidates[0]["Arn"]
+    raise RuntimeError("No SageMaker IAM role found. Create one in the AWS console.")
 
 
 def main():
