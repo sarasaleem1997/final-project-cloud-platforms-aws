@@ -15,9 +15,10 @@ COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 # Copy only what's needed to run the app
+# models/ is intentionally excluded — inference is delegated to the SageMaker endpoint
+# (set SAGEMAKER_ENDPOINT_NAME env var at runtime)
 COPY app/ ./app/
 COPY src/ ./src/
-COPY models/ ./models/
 COPY data/gold/ ./data/gold/
 
 # Expose Streamlit port

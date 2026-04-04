@@ -8,6 +8,7 @@ Usage:
     uv run streamlit run app/streamlit_app.py
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -17,7 +18,7 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from vaultech_analysis.inference import Predictor
+from vaultech_analysis.inference import Predictor, SageMakerPredictor
 
 GOLD_FILE = PROJECT_ROOT / "data" / "gold" / "pieces.parquet"
 
@@ -54,6 +55,10 @@ CUMULATIVE_LABELS = [
 
 @st.cache_resource
 def load_predictor():
+    endpoint = os.environ.get("SAGEMAKER_ENDPOINT_NAME")
+    if endpoint:
+        region = os.environ.get("AWS_DEFAULT_REGION", "eu-west-1")
+        return SageMakerPredictor(endpoint_name=endpoint, region=region)
     return Predictor()
 
 
@@ -170,6 +175,26 @@ if selected_rows:
             "Status": status,
         })
     st.dataframe(pd.DataFrame(partial_data), use_container_width=True, hide_index=True)
+
+    # Inference debug panel
+    st.markdown("**Inference debug**")
+    predictor = load_predictor()
+    debug_result = predictor.predict(
+        die_matrix=int(piece["die_matrix"]),
+        lifetime_2nd_strike_s=float(piece["lifetime_2nd_strike_s"]),
+        oee_cycle_time_s=float(piece["oee_cycle_time_s"]) if pd.notna(piece["oee_cycle_time_s"]) else None,
+    )
+    if "_debug" in debug_result:
+        dbg = debug_result["_debug"]
+        col_a, col_b, col_c = st.columns(3)
+        col_a.metric("Endpoint", dbg["endpoint"].split("/")[-1])
+        col_b.metric("Predicted bath time", f"{debug_result['predicted_bath_time_s']}s")
+        col_c.metric("Latency", f"{dbg['latency_ms']} ms")
+        with st.expander("Raw request / response"):
+            st.code(f"Payload sent:   {dbg['payload']}", language="text")
+            st.code(f"Raw response:   {dbg['raw_response']}", language="text")
+    else:
+        st.info(f"Local model prediction: {debug_result['predicted_bath_time_s']}s (no SageMaker endpoint configured)")
 
     # Synoptic bar chart
     st.markdown("**Actual vs reference partial times (process synoptic)**")
